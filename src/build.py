@@ -34,6 +34,17 @@ TOP_RANK = 30                   # 交集門檻：溢價前30 ∩ 未平倉市值
 TSMC_GATE = 0.002               # 台積電週期溢價 >= 0.2% 才亮綠燈
 SMALL_PREFIX = "小型"           # 大額表商品名的小型契約前綴（乘數 100，其餘 2000）
 
+# cover 影子名單（2026-09 以 2024-12~2026-08 共 21 期回測定案；cover = days-to-cover =
+# 特定法人前十大方向性口數換算張數 ÷ 近 20 日均量張數，衡量結算日被迫拆倉量相對市場胃納）
+ADV_DAYS = 20                   # cover 分母的取樣交易日數
+SHORT_PREM_MIN = 0.002          # 空方：週期溢價下限（回測平原 月t=3.8）
+SHORT_COVER_MIN = 0.15          # 空方：賣方 cover 下限
+SHORT_TOP_K = 3                 # 空方：取賣方 cover 最高前幾檔
+LONG_DISC_MAX = -0.002          # 多方：週期折價門檻（要更負；回測平原 月t=2.4）
+LONG_COVER_MIN = 0.05           # 多方：買方 cover 下限
+LONG_TOP_K = 2                  # 多方：取買方 cover 最高前幾檔
+FAT_DISCOUNT_POOL = 100         # 折價股超過此數＝全市場逆價差月（除息假折價充斥），多方停用
+
 
 def build_grid_marks():
     t = datetime.datetime.strptime(GRID_START, "%H:%M:%S")
@@ -132,6 +143,12 @@ def fill_daily_cache(cycle, mapping):
             prem, n_grids, fut_close = calc_one_contract_day(ticks, kbar_by_sid[sid])
             rows.append({"契約代碼": m["契約代碼"], "sid": sid, "契約乘數": m["契約乘數"],
                          "日均溢價": prem, "有效格數": n_grids, "期貨收盤": fut_close})
+        if not rows:
+            # 整天零契約 = 資料源還沒上這一天（盤後到晚間才進），不落地空檔——
+            # 落了 skip-existing 會把這天永久跳過
+            print(f"[cache] {day}: 尚無資料，不落地，下次重跑再補 (累計 API {finmind.n_calls})",
+                  flush=True)
+            continue
         pd.DataFrame(rows).to_csv(path + ".tmp", index=False, encoding="utf-8-sig")
         os.replace(path + ".tmp", path)
         print(f"[cache] {day}: {len(rows)} 契約 (累計 API {finmind.n_calls})", flush=True)
@@ -142,10 +159,11 @@ def fill_daily_cache(cycle, mapping):
 # ====================================================================
 
 def build_factors(cycle, mapping, stock_names):
-    daily = pd.concat([pd.read_csv(os.path.join(DAILY_DIR, f"{d}.csv"), encoding="utf-8-sig",
-                                   dtype={"契約代碼": str, "sid": str})
-                       for d in cycle["窗"]
-                       if os.path.exists(os.path.join(DAILY_DIR, f"{d}.csv"))],
+    cache_paths = [os.path.join(DAILY_DIR, f"{d}.csv") for d in cycle["窗"]]
+    cache_paths = [p for p in cache_paths
+                   if os.path.exists(p) and os.path.getsize(p) > 10]   # 防歷史殘留空檔
+    daily = pd.concat([pd.read_csv(p, encoding="utf-8-sig", dtype={"契約代碼": str, "sid": str})
+                       for p in cache_paths],
                       ignore_index=True)
     daily = daily.dropna(subset=["日均溢價"])
     per_contract = (daily.groupby(["契約代碼", "sid", "契約乘數"])
@@ -175,9 +193,15 @@ def build_factors(cycle, mapping, stock_names):
         weights = np.abs(g["市值元"].to_numpy())
         if weights.sum() <= 0:
             weights = g["契約乘數"].to_numpy(dtype=float)      # 退回乘數比（同生產）
+        buy_zhang = float((g["buy_top10_specific_open_interest"].fillna(0.0)
+                           * g["契約乘數"].astype(float)).sum()) / 1000.0
+        sell_zhang = float((g["sell_top10_specific_open_interest"].fillna(0.0)
+                            * g["契約乘數"].astype(float)).sum()) / 1000.0
         stocks.append({"sid": sid,
                        "週期溢價": float(np.average(g["週期溢價"], weights=weights)),
                        "未平倉市值_百萬": round(g["市值元"].sum() / 1e6),
+                       "買方OI張": round(buy_zhang, 1),
+                       "賣方OI張": round(sell_zhang, 1),
                        "有資料天數": int(g["有資料天數"].max())})
     factors = pd.DataFrame(stocks)
     names = dict(zip(stock_names["stock_id"], stock_names["stock_name"]))
@@ -194,6 +218,48 @@ def mark_strike_list(factors):
     df["打擊名單"] = (df["溢價排名"] <= TOP_RANK) & (df["倉位排名"] <= TOP_RANK)
     df["高溢價無倉"] = (df["溢價排名"] <= TOP_RANK) & ~df["打擊名單"]
     return df.sort_values("週期溢價", ascending=False)
+
+
+def fetch_adv20(stock_ids, data_day):
+    """近 ADV_DAYS 個交易日的日均成交張數（cover 的分母），一檔一次 API。
+    回傳: {sid: 張數}；抓不滿 ADV_DAYS 天的（新上市等）不收，該檔 cover 視為無資料。"""
+    start = data_day - datetime.timedelta(days=45)   # 45 個日曆日必含 20 個交易日
+    adv = {}
+    for i, sid in enumerate(stock_ids, 1):
+        px = finmind.fetch("TaiwanStockPrice", data_id=sid,
+                           start_date=str(start), end_date=str(data_day))
+        if len(px) >= ADV_DAYS:
+            adv[sid] = float(px.tail(ADV_DAYS)["Trading_Volume"].astype(float).mean()) / 1000.0
+        if i % 50 == 0:
+            print(f"  ADV20 {i}/{len(stock_ids)}...", flush=True)
+    return adv
+
+
+def is_fat_discount_month(factors):
+    """折價股檔數超過 FAT_DISCOUNT_POOL＝全市場逆價差月（除息假折價充斥）→ 多方腿停用"""
+    return int((factors["週期溢價"] < 0).sum()) > FAT_DISCOUNT_POOL
+
+
+def mark_cover_lists(factors, adv20):
+    """cover 影子名單：
+    空方 = 溢價 ≥ SHORT_PREM_MIN 且 賣方cover ≥ SHORT_COVER_MIN，取賣方 cover 前 SHORT_TOP_K
+    多方 = 折價 ≤ LONG_DISC_MAX 且 買方cover ≥ LONG_COVER_MIN，取買方 cover 前 LONG_TOP_K
+    （多方在全市場逆價差月整月停用，判定見 is_fat_discount_month）"""
+    df = factors.copy()
+    df["ADV20張"] = df["sid"].map(adv20)
+    df["空方cover"] = (df["賣方OI張"] / df["ADV20張"]).round(4)
+    df["多方cover"] = (df["買方OI張"] / df["ADV20張"]).round(4)
+
+    short_ok = (df["週期溢價"] >= SHORT_PREM_MIN) & (df["空方cover"] >= SHORT_COVER_MIN)
+    short_picks = df[short_ok].nlargest(SHORT_TOP_K, "空方cover")["sid"]
+    df["空方名單"] = df["sid"].isin(short_picks)
+
+    long_ok = (df["週期溢價"] <= LONG_DISC_MAX) & (df["多方cover"] >= LONG_COVER_MIN)
+    if is_fat_discount_month(df):
+        long_ok = pd.Series(False, index=df.index)
+    long_picks = df[long_ok].nlargest(LONG_TOP_K, "多方cover")["sid"]
+    df["多方名單"] = df["sid"].isin(long_picks)
+    return df
 
 
 # ====================================================================
@@ -224,6 +290,21 @@ def render_page(factors, cycle, data_day):
     all_rows = "\n".join(row_html(r) for _, r in factors.iterrows())
     updated = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
 
+    def cover_row_html(r, cover_column, oi_column):
+        return (f"<tr><td>{r['sid']}</td><td>{r['名稱']}</td>"
+                f"<td>{r['週期溢價']*100:+.3f}%</td><td>{r[oi_column]:,.0f}</td>"
+                f"<td>{r['ADV20張']:,.0f}</td><td><b>{r[cover_column]:.3f}</b></td></tr>")
+
+    EMPTY_COVER_ROW = '<tr><td colspan="6" style="text-align:center;color:#999">今日無符合條件標的</td></tr>'
+    shorts = factors[factors["空方名單"]].sort_values("空方cover", ascending=False)
+    longs = factors[factors["多方名單"]].sort_values("多方cover", ascending=False)
+    short_cover_rows = ("\n".join(cover_row_html(r, "空方cover", "賣方OI張")
+                                  for _, r in shorts.iterrows()) or EMPTY_COVER_ROW)
+    long_cover_rows = ("\n".join(cover_row_html(r, "多方cover", "買方OI張")
+                                 for _, r in longs.iterrows()) or EMPTY_COVER_ROW)
+    long_note = ("（本月折價股逾 %d 檔＝全市場逆價差，多方停用）" % FAT_DISCOUNT_POOL
+                 if is_fat_discount_month(factors) else "")
+
     html = f"""<!DOCTYPE html>
 <html lang="zh-Hant"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -238,11 +319,25 @@ margin-bottom:24px}} th,td{{border-bottom:1px solid #e3e5e8;padding:6px 10px;tex
 font-size:.92em}} th{{background:#eef0f3;cursor:pointer;position:sticky;top:0}}
 td:nth-child(2),td:nth-child(3),th:nth-child(2),th:nth-child(3){{text-align:left}}
 tr.strike{{background:#fff6e5}} .note{{color:#777;font-size:.85em;line-height:1.6}}
+.cover-wrap{{display:flex;gap:16px;flex-wrap:wrap}} .cover-wrap>div{{flex:1;min-width:320px}}
+h3{{font-size:1em;margin:4px 0 6px}}
 </style></head><body>
 <h1>futureblack — 期貨結算週期溢價看板</h1>
 <div class="banner">{banner_text}</div>
 <div class="meta">資料日 {data_day} ｜ 週期 {cycle['上次結算日'] + datetime.timedelta(days=1)} ~ 本次結算日
  <b>{cycle['本次結算日']}</b> ｜ 近月 {cycle['近月年月']} ｜ 更新 {updated:%Y-%m-%d %H:%M} (台北)</div>
+
+<h2>cover 名單（結算日 12:27~12:30 進場、12:56~12:59 出場，13:00 前一定出清）</h2>
+<div class="cover-wrap">
+<div><h3>空方放空：溢價 ≥{SHORT_PREM_MIN*100:.1f}% × 賣方cover ≥{SHORT_COVER_MIN} × 前{SHORT_TOP_K}檔</h3>
+<table><thead><tr><th>代碼</th><th>名稱</th><th>週期溢價</th><th>賣方OI(張)</th>
+<th>20日均量(張)</th><th>cover</th></tr></thead>
+<tbody>{short_cover_rows}</tbody></table></div>
+<div><h3>多方做多：折價 ≤{LONG_DISC_MAX*100:.1f}% × 買方cover ≥{LONG_COVER_MIN} × 前{LONG_TOP_K}檔{long_note}</h3>
+<table><thead><tr><th>代碼</th><th>名稱</th><th>週期溢價</th><th>買方OI(張)</th>
+<th>20日均量(張)</th><th>cover</th></tr></thead>
+<tbody>{long_cover_rows}</tbody></table></div>
+</div>
 
 <h2>打擊名單（溢價前{TOP_RANK} ∩ 未平倉市值前{TOP_RANK}，共 {len(strike)} 檔）</h2>
 <table id="t1"><thead><tr><th></th><th>代碼</th><th>名稱</th><th>週期溢價</th>
@@ -256,6 +351,9 @@ tr.strike{{background:#fff6e5}} .note{{color:#777;font-size:.85em;line-height:1.
 
 <div class="note">
 ★ = 打擊名單（兩因子皆前{TOP_RANK}）｜ ⚠ = 溢價高但未平倉不足（不打）<br>
+cover = 特定法人前十大方向性口數換算張數 ÷ 近{ADV_DAYS}日均量張數（days-to-cover，
+衡量結算日被迫拆倉量相對市場胃納）；空方取賣方口數、多方取買方口數。
+多方於全市場逆價差月（折價股 &gt;{FAT_DISCOUNT_POOL} 檔）停用。<br>
 溢價 = 週期內每日 53 個 5 分鐘格點的「期貨成交價/現貨成交價−1」日均，跨日平均，
 大小期以特定法人口數×乘數×收盤價加權。與內部版差異：成交價（非買賣報價雙邊）、無前日種子。<br>
 資料來源：FinMind（期貨逐筆、個股分K、期交所大額交易人）。每交易日 21:00 (台北) 自動更新。<br>
@@ -298,8 +396,13 @@ if __name__ == "__main__":
     fill_daily_cache(cycle, mapping)
     factors = build_factors(cycle, mapping, stock_names)
     factors = mark_strike_list(factors)
+
+    adv20 = fetch_adv20(factors["sid"].tolist(), data_day)
+    factors = mark_cover_lists(factors, adv20)
+
     factors.to_csv(os.path.join(REPO, "data", "factors_latest.csv"),
                    index=False, encoding="utf-8-sig")
     render_page(factors, cycle, data_day)
     print(f"完成：{len(factors)} 檔, 打擊名單 {int(factors['打擊名單'].sum())} 檔, "
+          f"cover 空方 {int(factors['空方名單'].sum())} / 多方 {int(factors['多方名單'].sum())} 檔, "
           f"API 共 {finmind.n_calls} 次", flush=True)
