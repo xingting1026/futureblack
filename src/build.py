@@ -31,7 +31,6 @@ SITE_DIR = os.path.join(REPO, "site")
 GRID_START, GRID_END, GRID_STEP_MIN = "09:05:00", "13:25:00", 5   # 53 格，同生產版
 MIN_GRIDS_PER_DAY = 10          # 有效格太少的契約日不納入（冷門到沒參考價值）
 TOP_RANK = 30                   # 交集門檻：溢價前30 ∩ 未平倉市值前30
-TSMC_GATE = 0.002               # 台積電週期溢價 >= 0.2% 才亮綠燈
 SMALL_PREFIX = "小型"           # 大額表商品名的小型契約前綴（乘數 100，其餘 2000）
 
 # cover 影子名單（2026-09 以 2024-12~2026-08 共 21 期回測定案；cover = days-to-cover =
@@ -242,9 +241,25 @@ def fetch_adv20(stock_ids, data_day):
     return adv
 
 
-def calc_pressure_score(factors):
-    """賣壓分數與跳水預估：分數對 67 日校準歷史取百分位 → 四分位 → 機率/幅度。
-    回傳 dict(分數, 百分位, 分位, 機率15, 機率25, 平均bps, 中位bps)"""
+def fetch_tx_close(cycle):
+    """近月台指期最近一個有資料日的收盤價（跳水幅度換算點數用）；抓不到回 None"""
+    start = cycle["窗"][-1] - datetime.timedelta(days=7)
+    tx = finmind.fetch("TaiwanFuturesDaily", data_id="TX",
+                       start_date=str(start), end_date=str(cycle["窗"][-1]))
+    if not len(tx):
+        return None
+    tx = tx[tx["contract_date"].astype(str) == cycle["近月年月"]]
+    if "trading_session" in tx.columns:
+        tx = tx[tx["trading_session"].astype(str) == "position"]
+    if not len(tx):
+        return None
+    return float(tx.sort_values("date")["close"].iloc[-1])
+
+
+def calc_pressure_score(factors, cycle):
+    """賣壓分數與跳水預估：分數對 67 日校準歷史取百分位 → 四分位 → 機率/幅度，
+    幅度另以近月台指收盤換算點數。
+    回傳 dict(分數, 百分位, 分位, 機率15, 機率25, 平均bps, 中位bps, 台指收盤, 平均點數, 中位點數)"""
     prem_side = factors[factors["週期溢價"] > 0]
     score = float((prem_side["週期溢價"]
                    * prem_side["未平倉市值_百萬"].abs()).sum()) / 100.0
@@ -252,8 +267,13 @@ def calc_pressure_score(factors):
     percentile = float((history <= score).mean()) * 100.0
     quartile = min(int(percentile // 25) + 1, 4)
     p15, p25, mean_bps, median_bps = DIVE_CALIB[quartile]
+
+    tx_close = fetch_tx_close(cycle)
+    mean_points = round(tx_close * mean_bps / 1e4) if tx_close else None
+    median_points = round(tx_close * median_bps / 1e4) if tx_close else None
     return {"分數": round(score, 2), "百分位": round(percentile), "分位": quartile,
-            "機率15": p15, "機率25": p25, "平均bps": mean_bps, "中位bps": median_bps}
+            "機率15": p15, "機率25": p25, "平均bps": mean_bps, "中位bps": median_bps,
+            "台指收盤": tx_close, "平均點數": mean_points, "中位點數": median_points}
 
 
 def is_fat_discount_month(factors):
@@ -289,25 +309,24 @@ def mark_cover_lists(factors, adv20):
 
 def render_page(factors, cycle, data_day, pressure):
     tsmc = factors.set_index("sid")["週期溢價"].get("2330", np.nan)
-    gate_on = pd.notna(tsmc) and tsmc >= TSMC_GATE
-    banner_color, banner_text = (("#0a7a2f", f"🟢 本月可打 — 台積電週期溢價 {tsmc*100:.2f}% ≥ 0.2%")
-                                 if gate_on else
-                                 ("#666", f"⚪ 本月休息 — 台積電週期溢價 "
-                                          f"{tsmc*100:.2f}% < 0.2%" if pd.notna(tsmc)
-                                  else "⚪ 台積電溢價無資料"))
-    strike = factors[factors["打擊名單"]]
+    tsmc_text = f"{tsmc*100:+.2f}%" if pd.notna(tsmc) else "無資料"
+    if pressure["台指收盤"]:
+        dive_text = f"{pressure['平均bps']} bps ≈ {pressure['平均點數']:+,.0f} 點"
+        dive_sub = (f"中位 {pressure['中位bps']} bps ≈ {pressure['中位點數']:+,.0f} 點｜"
+                    f"台指近月收盤 {pressure['台指收盤']:,.0f}")
+    else:
+        dive_text = f"{pressure['平均bps']} bps"
+        dive_sub = f"中位 {pressure['中位bps']} bps"
 
     def row_html(r):
-        flag = "★" if r["打擊名單"] else ("⚠" if r["高溢價無倉"] else "")
-        cls = ' class="strike"' if r["打擊名單"] else ""
-        return (f"<tr{cls}><td>{flag}</td><td>{r['sid']}</td><td>{r['名稱']}</td>"
+        flag = "⚠" if r["高溢價無倉"] else ""
+        return (f"<tr><td>{flag}</td><td>{r['sid']}</td><td>{r['名稱']}</td>"
                 f"<td data-v='{r['週期溢價']:.6f}'>{r['週期溢價']*100:.3f}%</td>"
                 f"<td data-v='{r['未平倉市值_百萬']}'>{r['未平倉市值_百萬']:,.0f}</td>"
                 f"<td>{int(r['溢價排名']) if pd.notna(r['溢價排名']) else ''}</td>"
                 f"<td>{int(r['倉位排名']) if pd.notna(r['倉位排名']) else ''}</td>"
                 f"<td>{r['有資料天數']}</td></tr>")
 
-    strike_rows = "\n".join(row_html(r) for _, r in strike.iterrows())
     all_rows = "\n".join(row_html(r) for _, r in factors.iterrows())
     updated = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
 
@@ -333,22 +352,31 @@ def render_page(factors, cycle, data_day, pressure):
 <style>
 body{{font-family:"Microsoft JhengHei","PingFang TC",sans-serif;margin:16px auto;max-width:1080px;
 background:#f5f6f8;color:#222}}
-h1{{font-size:1.4em}} .banner{{padding:12px 16px;border-radius:8px;color:#fff;font-weight:bold;
-font-size:1.1em;background:{banner_color}}}
+h1{{font-size:1.4em}}
+.stats{{display:flex;gap:12px;flex-wrap:wrap;margin:12px 0}}
+.stats>div{{flex:1;min-width:180px;background:#fff;border-radius:8px;padding:10px 14px;
+border:1px solid #e3e5e8}}
+.stats .k{{color:#666;font-size:.8em}} .stats .v{{font-size:1.5em;font-weight:bold;margin:2px 0}}
+.stats .s{{color:#888;font-size:.75em}}
 .meta{{color:#555;margin:8px 0 16px}} table{{border-collapse:collapse;width:100%;background:#fff;
 margin-bottom:24px}} th,td{{border-bottom:1px solid #e3e5e8;padding:6px 10px;text-align:right;
 font-size:.92em}} th{{background:#eef0f3;cursor:pointer;position:sticky;top:0}}
 td:nth-child(2),td:nth-child(3),th:nth-child(2),th:nth-child(3){{text-align:left}}
-tr.strike{{background:#fff6e5}} .note{{color:#777;font-size:.85em;line-height:1.6}}
+.note{{color:#777;font-size:.85em;line-height:1.6}}
 .cover-wrap{{display:flex;gap:16px;flex-wrap:wrap}} .cover-wrap>div{{flex:1;min-width:320px}}
 h3{{font-size:1em;margin:4px 0 6px}}
 </style></head><body>
 <h1>futureblack — 期貨結算週期溢價看板</h1>
-<div class="banner">{banner_text}</div>
-<div class="banner" style="background:#2c3e50;margin-top:8px">💥 賣壓分數 {pressure['分數']}
-（67 個結算日歷史第 {pressure['百分位']:.0f} 百分位，Q{pressure['分位']}）—
-結算日 12:30 跳水機率 ≥15bps 約 {pressure['機率15']}%、≥25bps 約 {pressure['機率25']}%，
-預期幅度 {pressure['平均bps']} bps（中位 {pressure['中位bps']}）</div>
+<div class="stats">
+<div><div class="k">台積電週期溢價</div><div class="v">{tsmc_text}</div>
+<div class="s">近月 {cycle['近月年月']}</div></div>
+<div><div class="k">賣壓分數</div><div class="v">{pressure['分數']}</div>
+<div class="s">67 個結算日歷史第 {pressure['百分位']:.0f} 百分位（Q{pressure['分位']}）</div></div>
+<div><div class="k">結算日 12:30 跳水機率</div><div class="v">{pressure['機率15']}%</div>
+<div class="s">跳 ≥15bps；跳 ≥25bps 為 {pressure['機率25']}%</div></div>
+<div><div class="k">預期跳水幅度</div><div class="v">{dive_text}</div>
+<div class="s">{dive_sub}</div></div>
+</div>
 <div class="meta">資料日 {data_day} ｜ 週期 {cycle['上次結算日'] + datetime.timedelta(days=1)} ~ 本次結算日
  <b>{cycle['本次結算日']}</b> ｜ 近月 {cycle['近月年月']} ｜ 更新 {updated:%Y-%m-%d %H:%M} (台北)</div>
 
@@ -364,18 +392,13 @@ h3{{font-size:1em;margin:4px 0 6px}}
 <tbody>{long_cover_rows}</tbody></table></div>
 </div>
 
-<h2>打擊名單（溢價前{TOP_RANK} ∩ 未平倉市值前{TOP_RANK}，共 {len(strike)} 檔）</h2>
-<table id="t1"><thead><tr><th></th><th>代碼</th><th>名稱</th><th>週期溢價</th>
-<th>未平倉市值(百萬)</th><th>溢價排名</th><th>倉位排名</th><th>資料天數</th></tr></thead>
-<tbody>{strike_rows}</tbody></table>
-
 <h2>全部個股期貨標的（{len(factors)} 檔，點欄位標題排序）</h2>
 <table id="t2"><thead><tr><th></th><th>代碼</th><th>名稱</th><th>週期溢價</th>
 <th>未平倉市值(百萬)</th><th>溢價排名</th><th>倉位排名</th><th>資料天數</th></tr></thead>
 <tbody>{all_rows}</tbody></table>
 
 <div class="note">
-★ = 打擊名單（兩因子皆前{TOP_RANK}）｜ ⚠ = 溢價高但未平倉不足（不打）<br>
+⚠ = 溢價前{TOP_RANK}但特定法人未平倉不足（無拆倉賣壓，不打）<br>
 cover = 特定法人前十大方向性口數換算張數 ÷ 近{ADV_DAYS}日均量張數（days-to-cover，
 衡量結算日被迫拆倉量相對市場胃納）；空方取賣方口數、多方取買方口數。
 多方於全市場逆價差月（折價股 &gt;{FAT_DISCOUNT_POOL} 檔）停用。<br>
@@ -427,7 +450,7 @@ if __name__ == "__main__":
 
     adv20 = fetch_adv20(factors["sid"].tolist(), data_day)
     factors = mark_cover_lists(factors, adv20)
-    pressure = calc_pressure_score(factors)
+    pressure = calc_pressure_score(factors, cycle)
 
     factors.to_csv(os.path.join(REPO, "data", "factors_latest.csv"),
                    index=False, encoding="utf-8-sig")
