@@ -45,6 +45,13 @@ LONG_COVER_MIN = 0.05           # 多方：買方 cover 下限
 LONG_TOP_K = 2                  # 多方：取買方 cover 最高前幾檔
 FAT_DISCOUNT_POOL = 100         # 折價股超過此數＝全市場逆價差月（除息假折價充斥），多方停用
 
+# 賣壓分數 → 結算日 12:30 跳水預估（67 個結算日 2021-02~2026-08 校準，T-1 時點）
+# 分數 = Σ(週期溢價 × |特定法人OI市值百萬|)/100，僅溢價側；四分位對照:
+# {分位: (跳水機率%≥15bps, 機率%≥25bps, 平均bps, 中位bps)}
+PRESSURE_HISTORY_PATH = "pressure_history.csv"   # data/ 下的校準歷史
+DIVE_CALIB = {1: (18, 0, -3.1, -4.7), 2: (41, 24, -9.4, -10.8),
+              3: (69, 44, -19.3, -21.2), 4: (71, 59, -25.7, -31.8)}
+
 
 def build_grid_marks():
     t = datetime.datetime.strptime(GRID_START, "%H:%M:%S")
@@ -235,6 +242,20 @@ def fetch_adv20(stock_ids, data_day):
     return adv
 
 
+def calc_pressure_score(factors):
+    """賣壓分數與跳水預估：分數對 67 日校準歷史取百分位 → 四分位 → 機率/幅度。
+    回傳 dict(分數, 百分位, 分位, 機率15, 機率25, 平均bps, 中位bps)"""
+    prem_side = factors[factors["週期溢價"] > 0]
+    score = float((prem_side["週期溢價"]
+                   * prem_side["未平倉市值_百萬"].abs()).sum()) / 100.0
+    history = pd.read_csv(os.path.join(REPO, "data", PRESSURE_HISTORY_PATH))["pressure"]
+    percentile = float((history <= score).mean()) * 100.0
+    quartile = min(int(percentile // 25) + 1, 4)
+    p15, p25, mean_bps, median_bps = DIVE_CALIB[quartile]
+    return {"分數": round(score, 2), "百分位": round(percentile), "分位": quartile,
+            "機率15": p15, "機率25": p25, "平均bps": mean_bps, "中位bps": median_bps}
+
+
 def is_fat_discount_month(factors):
     """折價股檔數超過 FAT_DISCOUNT_POOL＝全市場逆價差月（除息假折價充斥）→ 多方腿停用"""
     return int((factors["週期溢價"] < 0).sum()) > FAT_DISCOUNT_POOL
@@ -266,7 +287,7 @@ def mark_cover_lists(factors, adv20):
 # 頁面
 # ====================================================================
 
-def render_page(factors, cycle, data_day):
+def render_page(factors, cycle, data_day, pressure):
     tsmc = factors.set_index("sid")["週期溢價"].get("2330", np.nan)
     gate_on = pd.notna(tsmc) and tsmc >= TSMC_GATE
     banner_color, banner_text = (("#0a7a2f", f"🟢 本月可打 — 台積電週期溢價 {tsmc*100:.2f}% ≥ 0.2%")
@@ -324,6 +345,10 @@ h3{{font-size:1em;margin:4px 0 6px}}
 </style></head><body>
 <h1>futureblack — 期貨結算週期溢價看板</h1>
 <div class="banner">{banner_text}</div>
+<div class="banner" style="background:#2c3e50;margin-top:8px">💥 賣壓分數 {pressure['分數']}
+（67 個結算日歷史第 {pressure['百分位']:.0f} 百分位，Q{pressure['分位']}）—
+結算日 12:30 跳水機率 ≥15bps 約 {pressure['機率15']}%、≥25bps 約 {pressure['機率25']}%，
+預期幅度 {pressure['平均bps']} bps（中位 {pressure['中位bps']}）</div>
 <div class="meta">資料日 {data_day} ｜ 週期 {cycle['上次結算日'] + datetime.timedelta(days=1)} ~ 本次結算日
  <b>{cycle['本次結算日']}</b> ｜ 近月 {cycle['近月年月']} ｜ 更新 {updated:%Y-%m-%d %H:%M} (台北)</div>
 
@@ -354,6 +379,9 @@ h3{{font-size:1em;margin:4px 0 6px}}
 cover = 特定法人前十大方向性口數換算張數 ÷ 近{ADV_DAYS}日均量張數（days-to-cover，
 衡量結算日被迫拆倉量相對市場胃納）；空方取賣方口數、多方取買方口數。
 多方於全市場逆價差月（折價股 &gt;{FAT_DISCOUNT_POOL} 檔）停用。<br>
+賣壓分數 = Σ(週期溢價 × 特定法人OI市值)，預估結算日中午指數跳水（67 個結算日校準，
+2021-02~2026-08）。校準時點為 T-1：週期初 OI 尚未拆倉、分數與 cover 皆會偏高，
+越接近結算日越準。<br>
 溢價 = 週期內每日 53 個 5 分鐘格點的「期貨成交價/現貨成交價−1」日均，跨日平均，
 大小期以特定法人口數×乘數×收盤價加權。與內部版差異：成交價（非買賣報價雙邊）、無前日種子。<br>
 資料來源：FinMind（期貨逐筆、個股分K、期交所大額交易人）。每交易日 21:00 (台北) 自動更新。<br>
@@ -399,10 +427,12 @@ if __name__ == "__main__":
 
     adv20 = fetch_adv20(factors["sid"].tolist(), data_day)
     factors = mark_cover_lists(factors, adv20)
+    pressure = calc_pressure_score(factors)
 
     factors.to_csv(os.path.join(REPO, "data", "factors_latest.csv"),
                    index=False, encoding="utf-8-sig")
-    render_page(factors, cycle, data_day)
+    render_page(factors, cycle, data_day, pressure)
     print(f"完成：{len(factors)} 檔, 打擊名單 {int(factors['打擊名單'].sum())} 檔, "
           f"cover 空方 {int(factors['空方名單'].sum())} / 多方 {int(factors['多方名單'].sum())} 檔, "
+          f"賣壓分數 {pressure['分數']} (P{pressure['百分位']:.0f}), "
           f"API 共 {finmind.n_calls} 次", flush=True)
