@@ -53,6 +53,8 @@ DIVE_CALIB = {1: (18, 0, -3.1, -4.7), 2: (41, 24, -9.4, -10.8),
 # 跳水路徑公式（同 67 日迴歸；x = log10(溢價側特定法人OI市值百萬)，夾限在歷史範圍內）
 # 第一波 = 12:30→12:35、12:55 = 12:30→12:55、最深 = 12:30~13:00 最低點；殘差 σ≈14.5 bps
 DIVE_FORMULA = {"第一波": (40.2, -10.6), "12:55": (56.1, -16.2), "最深": (45.7, -16.4)}
+PATH_PROFILE_PATH = "path_profile.csv"   # 67 日分位平均走勢 12:27~13:05（相對 12:30，bps）
+CHART_MARKS = {"12:30:00": "進場", "12:35:00": "第一波", "12:55:00": "出場", "13:00:00": "底部"}
 
 
 def build_grid_marks():
@@ -316,21 +318,64 @@ def mark_cover_lists(factors, adv20):
 # 頁面
 # ====================================================================
 
+def render_path_chart(quartile):
+    """67 個結算日的賣壓分位平均走勢（12:27~13:05，相對 12:30 開盤 bps）→ inline SVG；
+    本月分位加粗、全體平均虛線、四個時間點畫垂直標記"""
+    prof = pd.read_csv(os.path.join(REPO, "data", PATH_PROFILE_PATH))
+    series = ["Q1", "Q2", "Q3", "Q4", "全體"]
+    colors = {"Q1": "#9ecae1", "Q2": "#6baed6", "Q3": "#3182bd", "Q4": "#08519c", "全體": "#999"}
+    minutes = prof["minute"].tolist()
+    width, height, left, right, top, bottom = 720, 250, 44, 40, 14, 34
+    y_min = min(-30.0, float(prof[series].min().min()) - 3)
+    y_max = max(10.0, float(prof[series].max().max()) + 3)
+
+    def x_of(i):
+        return left + (width - left - right) * i / (len(minutes) - 1)
+
+    def y_of(v):
+        return top + (height - top - bottom) * (y_max - v) / (y_max - y_min)
+
+    parts = [f'<svg viewBox="0 0 {width} {height}" width="100%" '
+             f'style="max-width:{width}px;background:#fff;border-radius:8px;border:1px solid #e3e5e8">']
+    for v in range(int(np.ceil(y_min / 10) * 10), int(y_max) + 1, 10):
+        parts.append(f'<line x1="{left}" y1="{y_of(v):.1f}" x2="{width - right}" y2="{y_of(v):.1f}" '
+                     f'stroke="{"#bbb" if v == 0 else "#eee"}"/>'
+                     f'<text x="{left - 6}" y="{y_of(v) + 4:.1f}" font-size="10" text-anchor="end" '
+                     f'fill="#888">{v:+d}</text>')
+    for minute, label in CHART_MARKS.items():
+        x = x_of(minutes.index(minute))
+        parts.append(f'<line x1="{x:.1f}" y1="{top}" x2="{x:.1f}" y2="{height - bottom}" '
+                     f'stroke="#e08080" stroke-dasharray="3,3"/>'
+                     f'<text x="{x:.1f}" y="{height - bottom + 14}" font-size="11" text-anchor="middle" '
+                     f'fill="#555">{minute[:5]} {label}</text>')
+    for col in series:
+        points = " ".join(f"{x_of(i):.1f},{y_of(v):.1f}" for i, v in enumerate(prof[col]))
+        is_current = col == f"Q{quartile}"
+        stroke_width = 3.5 if is_current else 1.3
+        dash = ' stroke-dasharray="5,3"' if col == "全體" else ""
+        parts.append(f'<polyline points="{points}" fill="none" stroke="{colors[col]}" '
+                     f'stroke-width="{stroke_width}"{dash}/>')
+        parts.append(f'<text x="{width - right + 4}" y="{y_of(float(prof[col].iloc[-1])) + 4:.1f}" '
+                     f'font-size="10" font-weight="{"bold" if is_current else "normal"}" '
+                     f'fill="{colors[col]}">{col}</text>')
+    parts.append("</svg>")
+    return "\n".join(parts)
+
+
 def render_page(factors, cycle, data_day, pressure):
     tsmc = factors.set_index("sid")["週期溢價"].get("2330", np.nan)
     tsmc_text = f"{tsmc*100:+.2f}%" if pd.notna(tsmc) else "無資料"
     bps, pts = pressure["路徑bps"], pressure["路徑點數"]
     if pressure["台指收盤"]:
-        dive_text = f"最深 {bps['最深']} bps ≈ {pts['最深']:+,.0f} 點"
-        dive_sub = (f"第一波 12:35 {bps['第一波']} bps ≈ {pts['第一波']:+,.0f} 點｜"
-                    f"12:55 {bps['12:55']} bps ≈ {pts['12:55']:+,.0f} 點｜"
-                    f"台指近月收盤 {pressure['台指收盤']:,.0f}")
+        dive_text = f"{pts['最深']:+,.0f} 點"
+        dive_sub = (f"最深 {bps['最深']} bps｜12:35 {pts['第一波']:+,.0f} 點｜"
+                    f"12:55 {pts['12:55']:+,.0f} 點｜台指 {pressure['台指收盤']:,.0f}")
     else:
-        dive_text = f"最深 {bps['最深']} bps"
-        dive_sub = f"第一波 12:35 {bps['第一波']} bps｜12:55 {bps['12:55']} bps"
-    dive_sub += "｜最深通常落在 12:50~12:58，13:00 後回彈"
+        dive_text = f"{bps['最深']} bps"
+        dive_sub = f"12:35 {bps['第一波']} bps｜12:55 {bps['12:55']} bps"
     if pressure["賣壓超出歷史"]:
-        dive_sub += "｜⚠ 賣壓超出 T-1 歷史範圍（週期初未拆倉），已夾限"
+        dive_sub += "｜⚠ 週期初，已夾限"
+    path_svg = render_path_chart(pressure["分位"])
 
     def row_html(r):
         flag = "⚠" if r["高溢價無倉"] else ""
@@ -388,9 +433,13 @@ h3{{font-size:1em;margin:4px 0 6px}}
 <div class="s">67 個結算日歷史第 {pressure['百分位']:.0f} 百分位（Q{pressure['分位']}）</div></div>
 <div><div class="k">結算日 12:30 跳水機率</div><div class="v">{pressure['機率15']}%</div>
 <div class="s">跳 ≥15bps；跳 ≥25bps 為 {pressure['機率25']}%</div></div>
-<div><div class="k">預期跳水幅度</div><div class="v">{dive_text}</div>
+<div><div class="k">預期最深跌幅（結算日 12:30~13:00）</div><div class="v">{dive_text}</div>
 <div class="s">{dive_sub}</div></div>
 </div>
+{path_svg}
+<div class="s" style="color:#888;font-size:.8em;margin:4px 0 16px">67 個結算日（2021-02~2026-08）加權指數平均走勢，
+相對 12:30 開盤（bps）；粗線＝本月賣壓分位 Q{pressure['分位']}，虛線＝全體平均。
+最深點通常落在 12:50~12:58，13:00 後回彈、收盤前回吐約八成。</div>
 <div class="meta">資料日 {data_day} ｜ 週期 {cycle['上次結算日'] + datetime.timedelta(days=1)} ~ 本次結算日
  <b>{cycle['本次結算日']}</b> ｜ 近月 {cycle['近月年月']} ｜ 更新 {updated:%Y-%m-%d %H:%M} (台北)</div>
 
