@@ -50,6 +50,9 @@ FAT_DISCOUNT_POOL = 100         # 折價股超過此數＝全市場逆價差月�
 PRESSURE_HISTORY_PATH = "pressure_history.csv"   # data/ 下的校準歷史
 DIVE_CALIB = {1: (18, 0, -3.1, -4.7), 2: (41, 24, -9.4, -10.8),
               3: (69, 44, -19.3, -21.2), 4: (71, 59, -25.7, -31.8)}
+# 跳水路徑公式（同 67 日迴歸；x = log10(溢價側特定法人OI市值百萬)，夾限在歷史範圍內）
+# 第一波 = 12:30→12:35、12:55 = 12:30→12:55、最深 = 12:30~13:00 最低點；殘差 σ≈14.5 bps
+DIVE_FORMULA = {"第一波": (40.2, -10.6), "12:55": (56.1, -16.2), "最深": (45.7, -16.4)}
 
 
 def build_grid_marks():
@@ -263,17 +266,23 @@ def calc_pressure_score(factors, cycle):
     prem_side = factors[factors["週期溢價"] > 0]
     score = float((prem_side["週期溢價"]
                    * prem_side["未平倉市值_百萬"].abs()).sum()) / 100.0
-    history = pd.read_csv(os.path.join(REPO, "data", PRESSURE_HISTORY_PATH))["pressure"]
-    percentile = float((history <= score).mean()) * 100.0
+    history = pd.read_csv(os.path.join(REPO, "data", PRESSURE_HISTORY_PATH))
+    percentile = float((history["pressure"] <= score).mean()) * 100.0
     quartile = min(int(percentile // 25) + 1, 4)
     p15, p25, mean_bps, median_bps = DIVE_CALIB[quartile]
 
+    sell_oi = float(prem_side["未平倉市值_百萬"].abs().sum())
+    log_oi_raw = np.log10(sell_oi) if sell_oi > 0 else history["log_sell_oi"].min()
+    log_oi = float(np.clip(log_oi_raw, history["log_sell_oi"].min(), history["log_sell_oi"].max()))
+    path_bps = {name: round(b0 + b1 * log_oi, 1) for name, (b0, b1) in DIVE_FORMULA.items()}
+
     tx_close = fetch_tx_close(cycle)
-    mean_points = round(tx_close * mean_bps / 1e4) if tx_close else None
-    median_points = round(tx_close * median_bps / 1e4) if tx_close else None
+    path_points = {name: (round(tx_close * bps / 1e4) if tx_close else None)
+                   for name, bps in path_bps.items()}
     return {"分數": round(score, 2), "百分位": round(percentile), "分位": quartile,
             "機率15": p15, "機率25": p25, "平均bps": mean_bps, "中位bps": median_bps,
-            "台指收盤": tx_close, "平均點數": mean_points, "中位點數": median_points}
+            "台指收盤": tx_close, "路徑bps": path_bps, "路徑點數": path_points,
+            "賣壓超出歷史": bool(log_oi_raw > log_oi)}
 
 
 def is_fat_discount_month(factors):
@@ -310,13 +319,18 @@ def mark_cover_lists(factors, adv20):
 def render_page(factors, cycle, data_day, pressure):
     tsmc = factors.set_index("sid")["週期溢價"].get("2330", np.nan)
     tsmc_text = f"{tsmc*100:+.2f}%" if pd.notna(tsmc) else "無資料"
+    bps, pts = pressure["路徑bps"], pressure["路徑點數"]
     if pressure["台指收盤"]:
-        dive_text = f"{pressure['平均bps']} bps ≈ {pressure['平均點數']:+,.0f} 點"
-        dive_sub = (f"中位 {pressure['中位bps']} bps ≈ {pressure['中位點數']:+,.0f} 點｜"
+        dive_text = f"最深 {bps['最深']} bps ≈ {pts['最深']:+,.0f} 點"
+        dive_sub = (f"第一波 12:35 {bps['第一波']} bps ≈ {pts['第一波']:+,.0f} 點｜"
+                    f"12:55 {bps['12:55']} bps ≈ {pts['12:55']:+,.0f} 點｜"
                     f"台指近月收盤 {pressure['台指收盤']:,.0f}")
     else:
-        dive_text = f"{pressure['平均bps']} bps"
-        dive_sub = f"中位 {pressure['中位bps']} bps"
+        dive_text = f"最深 {bps['最深']} bps"
+        dive_sub = f"第一波 12:35 {bps['第一波']} bps｜12:55 {bps['12:55']} bps"
+    dive_sub += "｜最深通常落在 12:50~12:58，13:00 後回彈"
+    if pressure["賣壓超出歷史"]:
+        dive_sub += "｜⚠ 賣壓超出 T-1 歷史範圍（週期初未拆倉），已夾限"
 
     def row_html(r):
         flag = "⚠" if r["高溢價無倉"] else ""
